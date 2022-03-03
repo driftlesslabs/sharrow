@@ -5,7 +5,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Index &#8212; v1.0.6</title>
+    <title>Index &#8212; v2.0.0</title>
     
   <link href="_static/css/theme.css" rel="stylesheet">
   <link href="_static/css/index.ff1ffe594081f20da1ef19478df9384b.css" rel="stylesheet">
@@ -83,7 +83,7 @@ const thebe_selector_output = ".output, .cell_output"
       <img src="_static/logo.png" class="logo" alt="logo">
       
       
-      <h1 class="site-logo" id="site-title">v1.0.6</h1>
+      <h1 class="site-logo" id="site-title">v2.0.0</h1>
       
     </a>
 </div><form class="bd-search d-flex align-items-center" action="search.html" method="get">
@@ -224,7 +224,6 @@ const thebe_selector_output = ".output, .cell_output"
  | <a href="#R"><strong>R</strong></a>
  | <a href="#S"><strong>S</strong></a>
  | <a href="#T"><strong>T</strong></a>
- | <a href="#U"><strong>U</strong></a>
  
 </div>
 <h2 id="A">A</h2>
@@ -240,8 +239,6 @@ const thebe_selector_output = ".output, .cell_output"
 </li>
       <li><a href="api.html#sharrow.Dataset.at">at() (Dataset method)</a>
 </li>
-      <li><a href="api.html#sharrow.Dataset.at_df">at_df() (Dataset method)</a>
-</li>
   </ul></td>
 </tr></table>
 
@@ -254,7 +251,7 @@ const thebe_selector_output = ".output, .cell_output"
   <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="api.html#sharrow.Relationship.child_name">child_name (Relationship attribute)</a>
 </li>
-      <li><a href="api.html#sharrow.Dataset.construct">construct() (Dataset class method)</a>
+      <li><a href="api.html#sharrow.dataset.construct">construct() (in module sharrow.dataset)</a>
 </li>
   </ul></td>
 </tr></table>
@@ -262,12 +259,14 @@ const thebe_selector_output = ".output, .cell_output"
 <h2 id="D">D</h2>
 <table style="width: 100%" class="indextable genindextable"><tr>
   <td style="width: 33%; vertical-align: top;"><ul>
-      <li><a href="api.html#sharrow.Dataset">Dataset (class in sharrow)</a>
-</li>
       <li><a href="api.html#sharrow.DataTree">DataTree (class in sharrow)</a>
 </li>
-      <li><a href="api.html#sharrow.Dataset.digital_encodings">digital_encodings (Dataset attribute)</a>
+      <li><a href="api.html#sharrow.Dataset.at.df">df() (Dataset.at method)</a>
+
+      <ul>
+        <li><a href="api.html#sharrow.Dataset.iat.df">(Dataset.iat method)</a>
 </li>
+      </ul></li>
   </ul></td>
   <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="api.html#sharrow.DataTree.digitize_relationships">digitize_relationships() (DataTree method)</a>
@@ -292,19 +291,19 @@ const thebe_selector_output = ".output, .cell_output"
   <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="api.html#sharrow.Flow">Flow (class in sharrow)</a>
 </li>
-      <li><a href="api.html#sharrow.Dataset.from_named_objects">from_named_objects() (Dataset class method)</a>
+      <li><a href="api.html#sharrow.dataset.from_named_objects">from_named_objects() (in module sharrow.dataset)</a>
 </li>
-      <li><a href="api.html#sharrow.Dataset.from_omx">from_omx() (Dataset class method)</a>
+      <li><a href="api.html#sharrow.dataset.from_omx">from_omx() (in module sharrow.dataset)</a>
 </li>
   </ul></td>
   <td style="width: 33%; vertical-align: top;"><ul>
-      <li><a href="api.html#sharrow.Dataset.from_omx_3d">from_omx_3d() (Dataset class method)</a>
+      <li><a href="api.html#sharrow.dataset.from_omx_3d">from_omx_3d() (in module sharrow.dataset)</a>
 </li>
-      <li><a href="api.html#sharrow.Dataset.from_shared_memory">from_shared_memory() (Dataset class method)</a>
+      <li><a href="api.html#sharrow.Dataset.shm.from_shared_memory">from_shared_memory() (Dataset.shm class method)</a>
 </li>
-      <li><a href="api.html#sharrow.Dataset.from_table">from_table() (Dataset class method)</a>
+      <li><a href="api.html#sharrow.dataset.from_table">from_table() (in module sharrow.dataset)</a>
 </li>
-      <li><a href="api.html#sharrow.Dataset.from_zarr">from_zarr() (Dataset class method)</a>
+      <li><a href="api.html#sharrow.dataset.from_zarr">from_zarr() (in module sharrow.dataset)</a>
 </li>
   </ul></td>
 </tr></table>
@@ -314,15 +313,15 @@ const thebe_selector_output = ".output, .cell_output"
   <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="api.html#sharrow.Dataset.iat">iat() (Dataset method)</a>
 </li>
-      <li><a href="api.html#sharrow.Dataset.iat_df">iat_df() (Dataset method)</a>
+      <li><a href="api.html#sharrow.Dataset.iloc">iloc() (Dataset method)</a>
 </li>
   </ul></td>
   <td style="width: 33%; vertical-align: top;"><ul>
-      <li><a href="api.html#sharrow.Dataset.iloc">iloc (Dataset attribute)</a>
-</li>
       <li><a href="api.html#sharrow.Relationship.indexing">indexing (Relationship attribute)</a>
 </li>
-      <li><a href="api.html#sharrow.Dataset.is_shared_memory">is_shared_memory (Dataset attribute)</a>
+      <li><a href="api.html#sharrow.Dataset.digital_encoding.info">info() (Dataset.digital_encoding method)</a>
+</li>
+      <li><a href="api.html#sharrow.Dataset.shm.is_shared_memory">is_shared_memory (Dataset.shm attribute)</a>
 </li>
   </ul></td>
 </tr></table>
@@ -332,13 +331,11 @@ const thebe_selector_output = ".output, .cell_output"
   <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="api.html#sharrow.Flow.load">load() (Flow method)</a>
 </li>
-      <li><a href="api.html#sharrow.Flow.load_dataarray">load_dataarray() (Flow method)</a>
-</li>
   </ul></td>
   <td style="width: 33%; vertical-align: top;"><ul>
-      <li><a href="api.html#sharrow.Flow.load_dataframe">load_dataframe() (Flow method)</a>
+      <li><a href="api.html#sharrow.Flow.load_dataarray">load_dataarray() (Flow method)</a>
 </li>
-      <li><a href="api.html#sharrow.Dataset.loc">loc (Dataset attribute)</a>
+      <li><a href="api.html#sharrow.Flow.load_dataframe">load_dataframe() (Flow method)</a>
 </li>
   </ul></td>
 </tr></table>
@@ -360,7 +357,7 @@ const thebe_selector_output = ".output, .cell_output"
   <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="api.html#sharrow.Relationship.parent_name">parent_name (Relationship attribute)</a>
 </li>
-      <li><a href="api.html#sharrow.Dataset.preload_shared_memory_size">preload_shared_memory_size() (Dataset class method)</a>
+      <li><a href="api.html#sharrow.Dataset.shm.preload_shared_memory_size">preload_shared_memory_size() (Dataset.shm static method)</a>
 </li>
   </ul></td>
 </tr></table>
@@ -374,7 +371,7 @@ const thebe_selector_output = ".output, .cell_output"
 </li>
   </ul></td>
   <td style="width: 33%; vertical-align: top;"><ul>
-      <li><a href="api.html#sharrow.Dataset.release_shared_memory">release_shared_memory() (Dataset method)</a>
+      <li><a href="api.html#sharrow.Dataset.shm.release_shared_memory">release_shared_memory() (Dataset.shm method)</a>
 </li>
       <li><a href="api.html#sharrow.DataTree.replace_datasets">replace_datasets() (DataTree method)</a>
 </li>
@@ -386,15 +383,15 @@ const thebe_selector_output = ".output, .cell_output"
 <h2 id="S">S</h2>
 <table style="width: 100%" class="indextable genindextable"><tr>
   <td style="width: 33%; vertical-align: top;"><ul>
-      <li><a href="api.html#sharrow.Dataset.set_digital_encoding">set_digital_encoding() (Dataset method)</a>
+      <li><a href="api.html#sharrow.Dataset.digital_encoding.set">set() (Dataset.digital_encoding method)</a>
 </li>
       <li><a href="api.html#sharrow.DataTree.setup_flow">setup_flow() (DataTree method)</a>
 </li>
-      <li><a href="api.html#sharrow.Dataset.shared_memory_key">shared_memory_key (Dataset attribute)</a>
+      <li><a href="api.html#sharrow.Dataset.shm.shared_memory_key">shared_memory_key (Dataset.shm attribute)</a>
 </li>
   </ul></td>
   <td style="width: 33%; vertical-align: top;"><ul>
-      <li><a href="api.html#sharrow.Dataset.shared_memory_size">shared_memory_size (Dataset attribute)</a>
+      <li><a href="api.html#sharrow.Dataset.shm.shared_memory_size">shared_memory_size (Dataset.shm attribute)</a>
 </li>
       <li><a href="api.html#sharrow.Flow.show_code">show_code() (Flow method)</a>
 </li>
@@ -406,15 +403,7 @@ const thebe_selector_output = ".output, .cell_output"
 <h2 id="T">T</h2>
 <table style="width: 100%" class="indextable genindextable"><tr>
   <td style="width: 33%; vertical-align: top;"><ul>
-      <li><a href="api.html#sharrow.Dataset.to_shared_memory">to_shared_memory() (Dataset method)</a>
-</li>
-  </ul></td>
-</tr></table>
-
-<h2 id="U">U</h2>
-<table style="width: 100%" class="indextable genindextable"><tr>
-  <td style="width: 33%; vertical-align: top;"><ul>
-      <li><a href="api.html#sharrow.Dataset.update">update() (Dataset method)</a>
+      <li><a href="api.html#sharrow.Dataset.shm.to_shared_memory">to_shared_memory() (Dataset.shm method)</a>
 </li>
   </ul></td>
 </tr></table>
