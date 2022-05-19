@@ -1343,6 +1343,7 @@ class Flow:
                     if argument.dtype.kind == "O":
                         argument = argument.astype("unicode")
                     arguments.append(argument)
+                    logger.info(f"prepared argument {arg} of type {argument.dtype}")
                 kwargs = {}
                 if dtype is not None:
                     kwargs["dtype"] = dtype
@@ -1357,6 +1358,7 @@ class Flow:
                     tree_root_dims[i]
                     for i in presorted(tree_root_dims, self.dim_order, self.dim_exclude)
                 ]
+                logger.info(f"calling to runner with argshape {argshape}")
                 return runner_(np.asarray(argshape), *arguments, **kwargs)
             except nb.TypingError as err:
                 _raw_functions = getattr(self, "_raw_functions", {})
