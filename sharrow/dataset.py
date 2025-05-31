@@ -4,6 +4,7 @@ import ast
 import base64
 import hashlib
 import logging
+import math
 import re
 import time
 from collections.abc import Hashable, Iterable, Mapping, Sequence
@@ -112,6 +113,184 @@ def construct(source):
         source = xr.Dataset(source)
     return source
 
+def _maybe_promote(dtype: np.dtype) -> tuple[np.dtype, Any]:
+    """This is a variant of xarray.core.dtypes.maybe_promote
+
+    This version preserves integer dtypes instead of promoting them floats.
+
+    Parameters
+    ----------
+    dtype : np.dtype
+
+    Returns
+    -------
+    dtype : Promoted dtype that can hold missing values.
+    fill_value : Valid missing value for the promoted dtype.
+    """
+    # N.B. these casting rules should match pandas
+    dtype_: np.typing.DTypeLike
+    fill_value: Any
+    if np.issubdtype(dtype, np.floating):
+        dtype_ = dtype
+        fill_value = np.nan
+    elif np.issubdtype(dtype, np.timedelta64):
+        # See https://github.com/numpy/numpy/issues/10685
+        # np.timedelta64 is a subclass of np.integer
+        # Check np.timedelta64 before np.integer
+        fill_value = np.timedelta64("NaT")
+        dtype_ = dtype
+    elif np.issubdtype(dtype, np.integer):
+        dtype_ = dtype
+        fill_value = 0
+    elif np.issubdtype(dtype, bool):
+        dtype_ = dtype
+        fill_value = False
+    elif np.issubdtype(dtype, np.complexfloating):
+        dtype_ = dtype
+        fill_value = np.nan + np.nan * 1j
+    elif np.issubdtype(dtype, np.datetime64):
+        dtype_ = dtype
+        fill_value = np.datetime64("NaT")
+    else:
+        dtype_ = object
+        fill_value = np.nan
+
+    dtype_out = np.dtype(dtype_)
+    fill_value = dtype_out.type(fill_value)
+    return dtype_out, fill_value
+
+
+def _set_numpy_data_from_dataframe_preserve_integers(
+    self: xr.Dataset, idx: pd.Index, arrays: list[tuple[Hashable, np.ndarray]], dims: tuple
+) -> None:
+    # This is a variant of the xarray.Dataset._set_numpy_data_from_dataframe
+    # method, that preserves integer dtypes instead of promoting them to
+    # floats.  The original promotes to float to place NaN values where there
+    # are missing values in the MultiIndex, which is not often desired with
+    # Sharrow, as missing values will be ignored, and we prefer to keep the integer
+    # dtype for performance and memory reasons.
+
+    if not isinstance(idx, pd.MultiIndex):
+        for name, values in arrays:
+            self[name] = (dims, values)
+        return
+
+    shape = tuple(lev.size for lev in idx.levels)
+    indexer = tuple(idx.codes)
+
+    # We already verified that the MultiIndex has all unique values, so
+    # there are missing values if and only if the size of output arrays is
+    # larger that the index.
+    missing_values = math.prod(shape) > idx.shape[0]
+
+    for name, values in arrays:
+        # NumPy indexing is much faster than using DataFrame.reindex() to
+        # fill in missing values:
+        # https://stackoverflow.com/a/35049899/809705
+        if missing_values:
+            dtype, fill_value = _maybe_promote(values.dtype)
+            data = np.full(shape, fill_value, dtype)
+        else:
+            # If there are no missing values, keep the existing dtype
+            # instead of promoting to support NA, e.g., keep integer
+            # columns as integers.
+            # TODO: consider removing this special case, which doesn't
+            # exist for sparse=True.
+            data = np.zeros(shape, values.dtype)
+        data[indexer] = values
+        self[name] = (dims, data)
+
+
+def dataset_from_dataframe_slow(dataframe: pd.DataFrame, sparse: bool = False) -> xr.Dataset:
+    """Convert a pandas.DataFrame into an xarray.Dataset
+
+    This is a variant of the xarray.Dataset.from_dataframe method. It is
+    changed from the original in that it preserves integer and boolean dtypes,
+    populating missing values with 0 or False, instead of promoting them to
+    floats and filling them with NaN.
+
+    Each column will be converted into an independent variable in the
+    Dataset. If the dataframe's index is a MultiIndex, it will be expanded
+    into a tensor product of one-dimensional indices (filling in missing
+    values with NaN). If you rather preserve the MultiIndex use
+    `xr.Dataset(df)`. This method will produce a Dataset very similar to
+    that on which the 'to_dataframe' method was called, except with
+    possibly redundant dimensions (since all dataset variables will have
+    the same dimensionality).
+
+    Parameters
+    ----------
+    dataframe : DataFrame
+        DataFrame from which to copy data and indices.
+    sparse : bool, default: False
+        If true, create a sparse arrays instead of dense numpy arrays. This
+        can potentially save a large amount of memory if the DataFrame has
+        a MultiIndex. Requires the sparse package (sparse.pydata.org).
+
+    Returns
+    -------
+    New Dataset.
+
+    See Also
+    --------
+    xarray.DataArray.from_series
+    pandas.DataFrame.to_xarray
+    """
+    # TODO: Add an option to remove dimensions along which the variables
+    # are constant, to enable consistent serialization to/from a dataframe,
+    # even if some variables have different dimensionality.
+
+    if not dataframe.columns.is_unique:
+        raise ValueError("cannot convert DataFrame with non-unique columns")
+
+    from xarray.core.variable import Variable
+    from xarray.core.indexes import (
+        Index,
+        PandasIndex,
+        remove_unused_levels_categories
+    )
+
+    idx = remove_unused_levels_categories(dataframe.index)
+
+    if isinstance(idx, pd.MultiIndex) and not idx.is_unique:
+        raise ValueError(
+            "cannot convert a DataFrame with a non-unique MultiIndex into xarray"
+        )
+
+    # Cast to a NumPy array first, in case the Series is a pandas Extension
+    # array (which doesn't have a valid NumPy dtype)
+    # TODO: allow users to control how this casting happens, e.g., by
+    # forwarding arguments to pandas.Series.to_numpy?
+    arrays = [(k, np.asarray(v)) for k, v in dataframe.items()]
+
+    indexes: dict[Hashable, Index] = {}
+    index_vars: dict[Hashable, Variable] = {}
+
+    if isinstance(idx, pd.MultiIndex):
+        dims = tuple(
+            name if name is not None else "level_%i" % n
+            for n, name in enumerate(idx.names)
+        )
+        for dim, lev in zip(dims, idx.levels):
+            xr_idx = PandasIndex(lev, dim)
+            indexes[dim] = xr_idx
+            index_vars.update(xr_idx.create_variables())
+    else:
+        index_name = idx.name if idx.name is not None else "index"
+        dims = (index_name,)
+        xr_idx = PandasIndex(idx, index_name)
+        indexes[index_name] = xr_idx
+        index_vars.update(xr_idx.create_variables())
+
+    obj = Dataset._construct_direct(index_vars, set(index_vars), indexes=indexes)
+
+    if sparse:
+        obj._set_sparse_data_from_dataframe(idx, arrays, dims)
+    else:
+        _set_numpy_data_from_dataframe_preserve_integers(obj, idx, arrays, dims)
+    return obj
+
+
 
 def dataset_from_dataframe_fast(
     dataframe: pd.DataFrame,
@@ -157,7 +336,7 @@ def dataset_from_dataframe_fast(
     # using a MultiIndex.
 
     if isinstance(dataframe.index, pd.MultiIndex) or sparse:
-        return Dataset.from_dataframe(dataframe, sparse)
+        return dataset_from_dataframe_slow(dataframe, sparse)
 
     if not dataframe.columns.is_unique:
         # if the dataframe has non-unique column names, but all the duplicate
