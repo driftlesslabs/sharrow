@@ -534,7 +534,12 @@ def _load_omx_assignments(dataset, source, assignments):
     if isinstance(source, h5py.File):
         file_context = contextlib.nullcontext(source)
     else:
-        file_context = h5py.File(source, "r")
+        filename = omx_file_name(source)
+        if filename is None:
+            raise TypeError(
+                "OMX sources must be h5py.File, path-like, or filename-bearing handles"
+            )
+        file_context = h5py.File(filename, "r")
     bytes_loaded = 0
     with file_context as handle:
         data_group = handle["data"]
@@ -557,6 +562,89 @@ def _load_omx_shared_worker(shared_memory_key, source, assignments):
             if flush is not None:
                 flush()
     return bytes_loaded
+
+
+def _prepare_omx_reload_assignments(dataset, sources, time_period_sep, ignore):
+    """Map OMX matrices to disjoint target arrays, preserving last-file-wins."""
+    assignments_by_target = {}
+    filenames = []
+
+    for source_number, source in enumerate(sources):
+        filename = omx_file_name(source)
+        filenames.append(filename)
+        if isinstance(source, h5py.File):
+            file_context = contextlib.nullcontext(source)
+        elif filename is not None:
+            file_context = h5py.File(filename, "r")
+        else:
+            raise TypeError(
+                "OMX sources must be h5py.File, path-like, or filename-bearing handles"
+            )
+
+        with file_context as handle:
+            for data_name in handle["data"]:
+                if _should_ignore(ignore, data_name):
+                    logger.info("ignoring %s", data_name)
+                    continue
+
+                if time_period_sep in data_name:
+                    variable_name, period_name = data_name.split(time_period_sep, 1)
+                    if variable_name not in dataset:
+                        logger.info(
+                            "skipping %s because %s not in dataset",
+                            data_name,
+                            variable_name,
+                        )
+                        continue
+                    variable = dataset[variable_name]
+                    if variable.ndim != 3:
+                        raise ValueError(
+                            f"dataset variable {variable_name} has "
+                            f"{variable.ndim} dimensions, expected 3"
+                        )
+                    period_dimension = variable.dims[-1]
+                    try:
+                        period = variable.get_index(period_dimension).get_loc(
+                            period_name
+                        )
+                    except KeyError:
+                        raise KeyError(
+                            f"time period {period_name!r} from {data_name!r} is not "
+                            f"in dataset coordinate {period_dimension!r}"
+                        ) from None
+                    if not isinstance(period, (int, np.integer)):
+                        raise ValueError(
+                            f"time period {period_name!r} does not identify one page"
+                        )
+                    period = int(period)
+                else:
+                    variable_name = data_name
+                    period = None
+                    if variable_name not in dataset:
+                        logger.info(
+                            "skipping %s because it is not in dataset", data_name
+                        )
+                        continue
+                    if dataset[variable_name].ndim != 2:
+                        raise ValueError(
+                            f"dataset variable {variable_name} has "
+                            f"{dataset[variable_name].ndim} dimensions, expected 2"
+                        )
+
+                # Multiple source files can contain the same matrix. Matching
+                # from_omx_3d, the last source wins without concurrent writes.
+                assignments_by_target[(variable_name, period)] = (
+                    source_number,
+                    data_name,
+                )
+
+    assignments = [[] for _ in sources]
+    for (variable_name, period), (
+        source_number,
+        data_name,
+    ) in assignments_by_target.items():
+        assignments[source_number].append((data_name, variable_name, period))
+    return filenames, assignments
 
 
 def _is_reopenable(filename) -> bool:
@@ -1013,6 +1101,7 @@ def reload_from_omx_3d(
     *,
     time_period_sep="__",
     ignore=None,
+    workers=None,
 ) -> None:
     """
     Reload the content of a dataset from OMX files.
@@ -1038,74 +1127,80 @@ def reload_from_omx_3d(
         match the name of a variable, that variable will not be included
         in the load process. This is useful for excluding variables that
         are not found in the target dataset.
+    workers : int, optional
+        Number of source files to load concurrently. By default, path-backed
+        OMX files are loaded with up to one process per source when ``dataset``
+        is shared-memory-backed. Ordinary in-process datasets and sources that
+        cannot be reopened are loaded serially. Set to 1 to force serial I/O.
     """
     if isinstance(ignore, str):
         ignore = [ignore]
     if isinstance(omx, (h5py.File, str, os.PathLike)) or omx_file_name(omx):
-        omx = [omx]
+        sources = [omx]
+    else:
+        sources = list(omx)
+    if workers is not None and (not isinstance(workers, int) or workers < 1):
+        raise ValueError("workers must be a positive integer")
 
-    bytes_loaded = 0
-    t0 = time.time()
+    filenames, assignments = _prepare_omx_reload_assignments(
+        dataset, sources, time_period_sep, ignore
+    )
+    active_batches = [
+        (source_number, batch)
+        for source_number, batch in enumerate(assignments)
+        if batch
+    ]
+    if not active_batches:
+        logger.info("no OMX matrices selected for reload")
+        return
 
-    def _load_one(dset, data_name, filter_note):
-        nonlocal bytes_loaded
-        t1 = time.time()
-        if time_period_sep in data_name:
-            data_name_x, data_name_t = data_name.split(time_period_sep, 1)
-            if data_name_x not in dataset:
-                logger.info(
-                    f"skipping {data_name} because {data_name_x} not in dataset"
-                )
-                return
-            if len(dataset[data_name_x].dims) != 3:
-                raise ValueError(
-                    f"dataset variable {data_name_x} has "
-                    f"{len(dataset[data_name_x].dims)} dimensions, expected 3"
-                )
-            period_dimension = dataset[data_name_x].dims[-1]
-            raw = dataset[data_name_x].sel({period_dimension: data_name_t}).data
-        else:
-            if data_name not in dataset:
-                logger.info(f"skipping {data_name} because it is not in dataset")
-                return
-            if len(dataset[data_name].dims) != 2:
-                raise ValueError(
-                    f"dataset variable {data_name} has "
-                    f"{len(dataset[data_name].dims)} dimensions, expected 2"
-                )
-            raw = dataset[data_name].data
-        _read_omx_dataset(dset, raw)
-        bytes_loaded += raw.nbytes
-        logger.debug(
-            f"loaded {data_name} ({filter_note}) to dataset "
-            f"in {time.time() - t1:.2f}s, {si_units(bytes_loaded)}"
+    parallel_capable = dataset.shm.is_shared_memory and all(
+        _is_reopenable(filenames[source_number]) for source_number, _ in active_batches
+    )
+    if workers is None:
+        worker_count = (
+            max(1, min(len(active_batches), os.cpu_count() or 1))
+            if parallel_capable
+            else 1
         )
+    else:
+        worker_count = min(workers, len(active_batches))
+        if worker_count > 1 and not parallel_capable:
+            raise ValueError(
+                "parallel OMX reload requires a shared-memory-backed dataset "
+                "and path-backed source files"
+            )
 
-    for source in omx:
-        if isinstance(source, (str, os.PathLike)):
-            logger.info(f"loading into dataset from {source}")
-            file_context = h5py.File(source, "r")
-        elif isinstance(source, h5py.File):
-            logger.info(f"loading into dataset from {source.filename}")
-            file_context = contextlib.nullcontext(source)
-        else:
-            filename = omx_file_name(source)
-            if filename is None:
-                raise TypeError(
-                    "omx entries must be h5py.File, path-like, or "
-                    "filename-bearing OMX handles"
+    started = time.time()
+    if worker_count == 1:
+        bytes_loaded = sum(
+            _load_omx_assignments(dataset, sources[source_number], batch)
+            for source_number, batch in active_batches
+        )
+    else:
+        shared_memory_key = dataset.shm.shared_memory_key
+        mp_context = multiprocessing.get_context("spawn")
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=worker_count, mp_context=mp_context
+        ) as pool:
+            futures = [
+                pool.submit(
+                    _load_omx_shared_worker,
+                    shared_memory_key,
+                    str(filenames[source_number]),
+                    batch,
                 )
-            logger.info(f"loading into dataset from {filename}")
-            file_context = h5py.File(filename, "r")
-        with file_context as handle:
-            data_group = handle["data"]
-            for data_name, dset in data_group.items():
-                if _should_ignore(ignore, data_name):
-                    logger.info(f"ignoring {data_name}")
-                    continue
-                filter_note = f"{dset.compression}/{dset.compression_opts}"
-                _load_one(dset, data_name, filter_note)
-    logger.info(f"loading to dataset complete in {time.time() - t0:.2f}s")
+                for source_number, batch in active_batches
+            ]
+            bytes_loaded = sum(future.result() for future in futures)
+
+    logger.info(
+        "reloaded %s from %d OMX files with %d worker(s) in %.2fs",
+        si_units(bytes_loaded),
+        len(active_batches),
+        worker_count,
+        time.time() - started,
+    )
 
 
 def _parquet_layout(labels_0, labels_1):

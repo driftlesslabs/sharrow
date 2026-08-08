@@ -584,6 +584,51 @@ def test_reload_from_omx_3d_compressed():
         xr.testing.assert_equal(custom_dims, expected.rename(time_period="period"))
 
 
+def test_reload_from_omx_3d_shared_parallel():
+    """Parallel reload fills only selected arrays and preserves source precedence."""
+    matrices = _random_matrices()
+    with tempfile.TemporaryDirectory() as tempdir:
+        first = Path(tempdir).joinpath("first.omx")
+        second = Path(tempdir).joinpath("second.omx")
+        _write_compressed_omx(
+            first, {name: data for name, data in matrices.items() if name != "TIME__PM"}
+        )
+        _write_compressed_omx(
+            second,
+            {
+                "DIST": matrices["DIST"] + 1,
+                "TIME__PM": matrices["TIME__PM"],
+            },
+        )
+
+        expected = sh.dataset.from_omx_3d(
+            [first, second], time_periods=["AM", "PM"], load="eager"
+        ).drop_vars("COUNTS")
+        blank = xr.zeros_like(expected)
+        token = "parallel-reload-" + secrets.token_hex(5)
+        shared = blank.shm.to_shared_memory(
+            token,
+            mode="r+",
+            load=False,
+            array_order={
+                name: "last-axis-first"
+                for name, variable in blank.data_vars.items()
+                if variable.ndim == 3
+            },
+        )
+        try:
+            sh.dataset.reload_from_omx_3d(shared, [first, second], workers=2)
+            xr.testing.assert_equal(shared, expected)
+            assert shared["TIME"].data[..., 0].flags.c_contiguous
+        finally:
+            shared.shm.release_shared_memory()
+
+        with pytest.raises(ValueError, match="shared-memory-backed"):
+            sh.dataset.reload_from_omx_3d(blank, [first, second], workers=2)
+        with pytest.raises(ValueError, match="positive integer"):
+            sh.dataset.reload_from_omx_3d(blank, [first, second], workers=0)
+
+
 def test_from_omx_compressed_blosc():
     import hdf5plugin
 
