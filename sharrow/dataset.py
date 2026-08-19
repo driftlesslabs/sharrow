@@ -649,6 +649,66 @@ def _load_omx_shared_worker(shared_memory_key, source, assignments):
     return bytes_loaded
 
 
+def _omx_worker_count(workers, batch_count):
+    """Choose a file-level worker count without creating idle workers."""
+    if batch_count < 1:
+        return 0
+    requested = (os.cpu_count() or 1) if workers is None else workers
+    return max(1, min(requested, batch_count))
+
+
+def _omx_uses_processes():
+    """Return whether file-level parallelism should use spawned processes."""
+    return os.name != "nt"
+
+
+def _load_omx_batches(dataset, active_batches, worker_count):
+    """Load independent source batches with a platform-safe executor.
+
+    Windows uses threads because its spawn-only multiprocessing model requires
+    callers to guard their program entry point and limits process pools to 61
+    workers. Raw HDF5 reads remain serialized by h5py, while chunk decompression
+    still runs concurrently in the shared decoder pool. Other platforms retain
+    process-level file parallelism without inheriting HDF5 state.
+    """
+    if not active_batches:
+        return 0
+    if worker_count == 1:
+        with _OmxReadCoordinator() as reader:
+            return sum(
+                _load_omx_assignments(dataset, source, batch, reader=reader)
+                for source, batch in active_batches
+            )
+
+    if not _omx_uses_processes():
+        with _OmxReadCoordinator() as reader:
+            with concurrent.futures.ThreadPoolExecutor(
+                max_workers=worker_count, thread_name_prefix="sharrow-omx-file"
+            ) as pool:
+                futures = [
+                    pool.submit(
+                        _load_omx_assignments,
+                        dataset,
+                        source,
+                        batch,
+                        reader,
+                    )
+                    for source, batch in active_batches
+                ]
+                return sum(future.result() for future in futures)
+
+    shared_memory_key = dataset.shm.shared_memory_key
+    mp_context = multiprocessing.get_context("spawn")
+    with concurrent.futures.ProcessPoolExecutor(
+        max_workers=worker_count, mp_context=mp_context
+    ) as pool:
+        futures = [
+            pool.submit(_load_omx_shared_worker, shared_memory_key, source, batch)
+            for source, batch in active_batches
+        ]
+        return sum(future.result() for future in futures)
+
+
 def _prepare_omx_reload_assignments(dataset, sources, time_period_sep, ignore):
     """Map OMX matrices to disjoint target arrays, preserving last-file-wins."""
     assignments_by_target = {}
@@ -807,17 +867,19 @@ def from_omx_3d(
     load : {"lazy", "eager", "shared", "memmap"}, default "lazy"
         Loading mode. ``"lazy"`` returns Dask arrays. ``"eager"`` loads into
         ordinary NumPy arrays in the calling process. ``"shared"`` uses
-        process-parallel reads into shared memory and is the fastest mode for
-        multiple large OMX files. ``"memmap"`` uses the same parallel loader
-        with disk-backed arrays, substantially reducing resident memory at the
-        cost of additional storage I/O.
+        parallel reads into shared memory and is the fastest mode for multiple
+        large OMX files. ``"memmap"`` uses the same parallel loader with
+        disk-backed arrays, substantially reducing resident memory at the cost
+        of additional storage I/O.
     task_granularity : {"variable", "matrix"}, default "variable"
         Dask task granularity for lazy loading. Grouping all time-period pages
         of a variable minimizes graph and file-open overhead. Matrix granularity
         can use less memory when only selected periods are subsequently loaded.
     workers : int, optional
-        Number of file-level worker processes for ``"shared"`` or ``"memmap"``.
-        The default uses up to one worker per source file. Eager loading uses
+        Number of source files to load concurrently for ``"shared"`` or
+        ``"memmap"``. The default uses up to one worker per source file.
+        Windows uses threads so this API is safe in ordinary scripts and
+        notebooks; other platforms use spawned processes. Eager loading uses
         one worker in the calling process.
     memory_path : path-like, optional
         New backing file to create when ``load="memmap"``. The associated
@@ -847,7 +909,7 @@ def from_omx_3d(
         raise ValueError("workers must be a positive integer")
     if load == "eager" and workers not in {None, 1}:
         raise ValueError(
-            "load='eager' uses one process; use load='shared' for parallel reads"
+            "load='eager' uses one worker; use load='shared' for parallel reads"
         )
     if load == "memmap" and memory_path is None:
         raise ValueError("memory_path is required when load='memmap'")
@@ -1089,7 +1151,7 @@ def from_omx_3d(
             return result
 
         # Shared and memory-mapped modes use a lightweight template to reserve
-        # one contiguous backing buffer, then independent processes fill each
+        # one contiguous backing buffer, then independent workers fill each
         # source file directly into disjoint final-array pages.
         if not all(omx_reopenable[n] for n, batch in enumerate(assignments) if batch):
             raise ValueError(
@@ -1140,26 +1202,10 @@ def from_omx_3d(
             for n, batch in enumerate(assignments)
             if batch
         ]
-        worker_count = workers or max(1, min(len(active_batches), os.cpu_count() or 1))
+        worker_count = _omx_worker_count(workers, len(active_batches))
         started = time.time()
         try:
-            if worker_count == 1:
-                with _OmxReadCoordinator() as reader:
-                    bytes_loaded = sum(
-                        _load_omx_assignments(result, source, batch, reader=reader)
-                        for source, batch in active_batches
-                    )
-            else:
-                # Spawn avoids inheriting any HDF5 state held by the caller.
-                mp_context = multiprocessing.get_context("spawn")
-                with concurrent.futures.ProcessPoolExecutor(
-                    max_workers=worker_count, mp_context=mp_context
-                ) as pool:
-                    futures = [
-                        pool.submit(_load_omx_shared_worker, key, source, batch)
-                        for source, batch in active_batches
-                    ]
-                    bytes_loaded = sum(future.result() for future in futures)
+            bytes_loaded = _load_omx_batches(result, active_batches, worker_count)
             if load == "memmap":
                 for memory_object in result.shm._shared_memory_objs_:
                     flush = getattr(memory_object, "flush", None)
@@ -1221,9 +1267,10 @@ def reload_from_omx_3d(
         are not found in the target dataset.
     workers : int, optional
         Number of source files to load concurrently. By default, path-backed
-        OMX files are loaded with up to one process per source when ``dataset``
-        is shared-memory-backed. Ordinary in-process datasets and sources that
-        cannot be reopened are loaded serially. Set to 1 to force serial I/O.
+        OMX files are loaded concurrently when ``dataset`` is shared-memory-
+        backed. Windows uses threads; other platforms use spawned processes.
+        Ordinary in-process datasets and sources that cannot be reopened are
+        loaded serially. Set to 1 to force serial I/O.
     """
     if isinstance(ignore, str):
         ignore = [ignore]
@@ -1251,12 +1298,10 @@ def reload_from_omx_3d(
     )
     if workers is None:
         worker_count = (
-            max(1, min(len(active_batches), os.cpu_count() or 1))
-            if parallel_capable
-            else 1
+            _omx_worker_count(None, len(active_batches)) if parallel_capable else 1
         )
     else:
-        worker_count = min(workers, len(active_batches))
+        worker_count = _omx_worker_count(workers, len(active_batches))
         if worker_count > 1 and not parallel_capable:
             raise ValueError(
                 "parallel OMX reload requires a shared-memory-backed dataset "
@@ -1264,33 +1309,11 @@ def reload_from_omx_3d(
             )
 
     started = time.time()
-    if worker_count == 1:
-        with _OmxReadCoordinator() as reader:
-            bytes_loaded = sum(
-                _load_omx_assignments(
-                    dataset,
-                    sources[source_number],
-                    batch,
-                    reader=reader,
-                )
-                for source_number, batch in active_batches
-            )
-    else:
-        shared_memory_key = dataset.shm.shared_memory_key
-        mp_context = multiprocessing.get_context("spawn")
-        with concurrent.futures.ProcessPoolExecutor(
-            max_workers=worker_count, mp_context=mp_context
-        ) as pool:
-            futures = [
-                pool.submit(
-                    _load_omx_shared_worker,
-                    shared_memory_key,
-                    str(filenames[source_number]),
-                    batch,
-                )
-                for source_number, batch in active_batches
-            ]
-            bytes_loaded = sum(future.result() for future in futures)
+    load_batches = [
+        (str(filenames[source_number]), batch)
+        for source_number, batch in active_batches
+    ]
+    bytes_loaded = _load_omx_batches(dataset, load_batches, worker_count)
 
     logger.info(
         "reloaded %s from %d OMX files with %d worker(s) in %.2fs",

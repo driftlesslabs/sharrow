@@ -1,4 +1,5 @@
 import atexit
+import contextlib
 import hashlib
 import logging
 import os
@@ -224,6 +225,20 @@ def delete_shared_memory_files(key):
             os.unlink(mmap_filename + ".meta.pkl")
 
 
+def _close_memmap_objects(memory_objects, buffer=None):
+    """Flush and close memmap resources so Windows can unlink their files."""
+    if buffer is not None:
+        buffer.release()
+    for memory_object in memory_objects:
+        if isinstance(memory_object, np.memmap):
+            try:
+                memory_object.flush()
+            finally:
+                mmap = getattr(memory_object, "_mmap", None)
+                if mmap is not None and not mmap.closed:
+                    mmap.close()
+
+
 @xr.register_dataset_accessor("shm")
 class SharedMemDatasetAccessor:
     _parent_class = xr.Dataset
@@ -252,15 +267,9 @@ class SharedMemDatasetAccessor:
             # memory registry. Release the Dataset's own buffer and mapping so
             # Windows can delete or replace the backing file immediately.
             buffer = getattr(self, "_buffer", None)
+            _close_memmap_objects(self._shared_memory_objs_, buffer=buffer)
             if buffer is not None:
-                buffer.release()
                 del self._buffer
-            for memory_object in self._shared_memory_objs_:
-                if isinstance(memory_object, np.memmap):
-                    memory_object.flush()
-                    mmap = getattr(memory_object, "_mmap", None)
-                    if mmap is not None and not mmap.closed:
-                        mmap.close()
             self._shared_memory_objs_.clear()
             self._shared_memory_owned_ = False
         else:
@@ -401,87 +410,106 @@ class SharedMemDatasetAccessor:
             a = self._obj[k]
             emit(k, a, False)
 
-        mem = create_shared_memory_array(key, size=position)
+        is_memmap = key.startswith("memmap:")
+        memmap_created = is_memmap and not os.path.isfile(key[7:])
+        mem = None
+        buffer = None
+        try:
+            mem = create_shared_memory_array(key, size=position)
+            logger.debug("declaring shared memory buffer")
+            buffer = memoryview(mem) if is_memmap else mem.buf
 
-        logger.debug("declaring shared memory buffer")
-        if key.startswith("memmap:"):
-            buffer = memoryview(mem)
-        else:
-            buffer = mem.buf
+            if pre_init:
+                logger.debug("pre-initializing shared memory buffer")
+                # Fill in place.  Constructing a same-sized bytes object can
+                # temporarily double memory use for multi-gigabyte skim datasets.
+                np.ndarray(len(buffer), dtype=np.uint8, buffer=buffer).fill(0)
 
-        if pre_init:
-            logger.debug("pre-initializing shared memory buffer")
-            # Fill in place.  Constructing a same-sized bytes object can
-            # temporarily double memory use for multi-gigabyte skim datasets.
-            np.ndarray(len(buffer), dtype=np.uint8, buffer=buffer).fill(0)
-
-        tasks = []
-        task_names = []
-        for w in wrappers:
-            _is_sparse = w.get("sparse", False)
-            _size = w["nbytes"]
-            _name = w["name"]
-            _pos = w["position"]
-            a = self._obj[_name]
-            if _is_sparse:
-                logger.info(f"running load task: {_name} ({si_units(_size)})")
-                ad = a.data
-                _size_d = w["data.nbytes"]
-                _size_i = w["indices.nbytes"]
-                _size_p = w["indptr.nbytes"]
-                mem_arr_d = np.ndarray(
-                    shape=(_size_d // ad.data.dtype.itemsize,),
-                    dtype=ad.data.dtype,
-                    buffer=buffer[_pos : _pos + _size_d],
-                )
-                mem_arr_i = np.ndarray(
-                    shape=(_size_i // ad.indices.dtype.itemsize,),
-                    dtype=ad.indices.dtype,
-                    buffer=buffer[_pos + _size_d : _pos + _size_d + _size_i],
-                )
-                mem_arr_p = np.ndarray(
-                    shape=(_size_p // ad.indptr.dtype.itemsize,),
-                    dtype=ad.indptr.dtype,
-                    buffer=buffer[
-                        _pos + _size_d + _size_i : _pos + _size_d + _size_i + _size_p
-                    ],
-                )
-                mem_arr_d[:] = ad.data[:]
-                mem_arr_i[:] = ad.indices[:]
-                mem_arr_p[:] = ad.indptr[:]
-            else:
-                logger.debug(f"preparing load task: {_name} ({si_units(_size)})")
-                mem_arr = np.ndarray(
-                    shape=a.shape,
-                    dtype=a.dtype,
-                    buffer=buffer[_pos : _pos + _size],
-                    strides=w.get("strides"),
-                )
-                if isinstance(a, xr.DataArray) and isinstance(a.data, da.Array):
-                    tasks.append(da.store(a.data, mem_arr, lock=False, compute=False))
-                    task_names.append(_name)
+            tasks = []
+            task_names = []
+            for w in wrappers:
+                _is_sparse = w.get("sparse", False)
+                _size = w["nbytes"]
+                _name = w["name"]
+                _pos = w["position"]
+                a = self._obj[_name]
+                if _is_sparse:
+                    logger.info(f"running load task: {_name} ({si_units(_size)})")
+                    ad = a.data
+                    _size_d = w["data.nbytes"]
+                    _size_i = w["indices.nbytes"]
+                    _size_p = w["indptr.nbytes"]
+                    mem_arr_d = np.ndarray(
+                        shape=(_size_d // ad.data.dtype.itemsize,),
+                        dtype=ad.data.dtype,
+                        buffer=buffer[_pos : _pos + _size_d],
+                    )
+                    mem_arr_i = np.ndarray(
+                        shape=(_size_i // ad.indices.dtype.itemsize,),
+                        dtype=ad.indices.dtype,
+                        buffer=buffer[_pos + _size_d : _pos + _size_d + _size_i],
+                    )
+                    mem_arr_p = np.ndarray(
+                        shape=(_size_p // ad.indptr.dtype.itemsize,),
+                        dtype=ad.indptr.dtype,
+                        buffer=buffer[
+                            _pos + _size_d + _size_i : _pos
+                            + _size_d
+                            + _size_i
+                            + _size_p
+                        ],
+                    )
+                    mem_arr_d[:] = ad.data[:]
+                    mem_arr_i[:] = ad.indices[:]
+                    mem_arr_p[:] = ad.indptr[:]
                 else:
-                    mem_arr[:] = a[:]
-        if tasks and load:
-            self.tasks = tasks
-            self.task_names = task_names
-            self.run_tasks(dask_scheduler=dask_scheduler)
+                    logger.debug(f"preparing load task: {_name} ({si_units(_size)})")
+                    mem_arr = np.ndarray(
+                        shape=a.shape,
+                        dtype=a.dtype,
+                        buffer=buffer[_pos : _pos + _size],
+                        strides=w.get("strides"),
+                    )
+                    if isinstance(a, xr.DataArray) and isinstance(a.data, da.Array):
+                        tasks.append(
+                            da.store(a.data, mem_arr, lock=False, compute=False)
+                        )
+                        task_names.append(_name)
+                    else:
+                        mem_arr[:] = a[:]
+            if tasks and load:
+                self.tasks = tasks
+                self.task_names = task_names
+                self.run_tasks(dask_scheduler=dask_scheduler)
 
-        if key.startswith("memmap:"):
-            mem.flush()
+            if is_memmap:
+                mem.flush()
 
-        logger.info("storing metadata in shared memory")
-        create_shared_list(
-            [pickle.dumps(self._obj.attrs)] + [pickle.dumps(i) for i in wrappers], key
-        )
-        result = type(self).from_shared_memory(key, own_data=mem, mode=mode)
-        if tasks and not load:
-            # attach incompleted tasks to the result
-            result.shm.tasks = tasks
-            result.shm.task_names = task_names
-        result.shm._buffer = buffer
-        result.shm._position = position
-        return result
+            logger.info("storing metadata in shared memory")
+            create_shared_list(
+                [pickle.dumps(self._obj.attrs)] + [pickle.dumps(i) for i in wrappers],
+                key,
+            )
+            result = type(self).from_shared_memory(key, own_data=mem, mode=mode)
+            if tasks and not load:
+                # attach incompleted tasks to the result
+                result.shm.tasks = tasks
+                result.shm.task_names = task_names
+            result.shm._buffer = buffer
+            result.shm._position = position
+            return result
+        except BaseException:
+            if is_memmap:
+                if mem is not None:
+                    with contextlib.suppress(Exception):
+                        _close_memmap_objects([mem], buffer=buffer)
+                if memmap_created:
+                    with contextlib.suppress(Exception):
+                        delete_shared_memory_files(key)
+            elif mem is not None:
+                with contextlib.suppress(Exception):
+                    release_shared_memory(key)
+            raise
 
     def run_tasks(self, dask_scheduler="threads"):
         """Run any deferred dask tasks."""

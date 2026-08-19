@@ -9,7 +9,8 @@ result plus a small, bounded number of in-flight chunks.
 
 If a dataset uses a filter this module does not know how to invert, reading
 transparently falls back to h5py, which will use the registered HDF5 filter
-plugins instead.
+plugins instead. Standard gzip/shuffle OMX data needs no optional plugin;
+install ``sharrow[hdf5-plugins]`` for Blosc and other HDF5 filter families.
 
 This module is adapted from the ``omx_fast_reader`` module of the `wring
 <https://github.com/driftlesslabs/wring>`_ project.
@@ -23,10 +24,19 @@ import threading
 import zlib
 from collections.abc import Sequence
 
-import blosc2
 import h5py
-import hdf5plugin  # noqa: F401  (registers blosc/blosc2/zstd/etc HDF5 filters)
 import numpy as np
+
+try:
+    import blosc2
+except ImportError:  # Blosc-compressed OMX files require the optional extra.
+    blosc2 = None
+
+try:
+    # Optional plugins let h5py handle filters outside the native fast path.
+    import hdf5plugin  # noqa: F401
+except ImportError:  # Standard gzip/shuffle OMX files do not need plugins.
+    hdf5plugin = None
 
 __all__ = [
     "read_dataset",
@@ -45,8 +55,7 @@ SUPPORTED_FILTERS = frozenset(
         H5Z_FILTER_DEFLATE,
         H5Z_FILTER_SHUFFLE,
         H5Z_FILTER_FLETCHER32,
-        H5Z_FILTER_BLOSC,
-        H5Z_FILTER_BLOSC2,
+        *((H5Z_FILTER_BLOSC, H5Z_FILTER_BLOSC2) if blosc2 is not None else ()),
     }
 )
 
@@ -148,6 +157,8 @@ def _decode_blosc2_cframe(data: bytes):
     bytes or numpy.ndarray
         The decompressed payload.
     """
+    if blosc2 is None:
+        raise ImportError("Blosc-compressed OMX data requires sharrow[hdf5-plugins]")
     try:
         return blosc2.ndarray_from_cframe(data)[:]
     except (RuntimeError, ValueError):

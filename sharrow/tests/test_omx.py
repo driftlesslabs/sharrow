@@ -1,3 +1,5 @@
+import subprocess
+import sys
 from pathlib import Path
 
 import h5py
@@ -49,6 +51,41 @@ def test_split_omx_with_global_lookups(omx_file, tmp_path):
                 assert dataset.compression == "gzip"
                 np.testing.assert_array_equal(dataset, matrices[name])
     assert matrix_names == set(matrices)
+
+
+def test_gzip_omx_load_without_optional_filter_packages(omx_file):
+    """The base installation reads standard HDF5 filters without plugins."""
+    source_path, _ = omx_file
+    code = """
+import builtins
+import sys
+
+real_import = builtins.__import__
+
+
+def import_without_optional_filters(name, *args, **kwargs):
+    if name.split('.', 1)[0] in {'blosc2', 'hdf5plugin'}:
+        raise ImportError(f'blocked optional dependency: {name}')
+    return real_import(name, *args, **kwargs)
+
+
+builtins.__import__ = import_without_optional_filters
+import sharrow as sh
+from sharrow import omx_reader
+
+assert omx_reader.blosc2 is None
+assert omx_reader.hdf5plugin is None
+dataset = sh.dataset.from_omx_3d(
+    sys.argv[1], time_periods=['AM', 'PM'], load='eager'
+)
+assert dataset['TIME'].shape == (3, 3, 2)
+"""
+    subprocess.run(
+        [sys.executable, "-c", code, str(source_path)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
 
 
 def test_split_omx_with_separate_lookups(omx_file, tmp_path):

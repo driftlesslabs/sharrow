@@ -598,6 +598,66 @@ def test_from_omx_3d_memmap_low_memory():
         assert not Path(f"{backing}.meta.pkl").exists()
 
 
+def test_windows_parallel_backend_uses_threads(monkeypatch, tmp_path):
+    """The Windows backend avoids spawn and caps workers to active sources."""
+    matrices = _random_matrices()
+    first = tmp_path / "first.omx"
+    second = tmp_path / "second.omx"
+    backing = tmp_path / "skims-memory.dat"
+    _write_compressed_omx(
+        first, {name: data for name, data in matrices.items() if name != "TIME__PM"}
+    )
+    _write_compressed_omx(second, {"TIME__PM": matrices["TIME__PM"]})
+    expected = sh.dataset.from_omx_3d(
+        [first, second], time_periods=["EA", "AM", "PM"], load="eager"
+    )
+
+    def forbid_process_pool(*args, **kwargs):
+        pytest.fail("the Windows OMX backend must not create a process pool")
+
+    monkeypatch.setattr(sh.dataset, "_omx_uses_processes", lambda: False)
+    monkeypatch.setattr(
+        sh.dataset.concurrent.futures, "ProcessPoolExecutor", forbid_process_pool
+    )
+    mapped = sh.dataset.from_omx_3d(
+        [first, second],
+        time_periods=["EA", "AM", "PM"],
+        load="memmap",
+        memory_path=backing,
+        workers=100,
+    )
+    key = mapped.shm.shared_memory_key
+    try:
+        xr.testing.assert_equal(mapped, expected)
+        assert sh.dataset._omx_worker_count(100, 2) == 2
+    finally:
+        mapped.shm.release_shared_memory()
+        mapped.shm.delete_shared_memory_files(key)
+
+
+def test_memmap_metadata_failure_removes_new_backing_file(monkeypatch, tmp_path):
+    """Partial memmap construction is transactional, including on Windows."""
+    source = tmp_path / "skims.omx"
+    backing = tmp_path / "skims-memory.dat"
+    _write_compressed_omx(source, _random_matrices())
+
+    def fail_metadata(*args, **kwargs):
+        raise RuntimeError("injected metadata failure")
+
+    monkeypatch.setattr(sh.shared_memory, "create_shared_list", fail_metadata)
+    with pytest.raises(RuntimeError, match="injected metadata failure"):
+        sh.dataset.from_omx_3d(
+            source,
+            time_periods=["EA", "AM", "PM"],
+            load="memmap",
+            memory_path=backing,
+            workers=1,
+        )
+
+    assert not backing.exists()
+    assert not Path(f"{backing}.meta.pkl").exists()
+
+
 def test_from_omx_3d_memmap_failure_releases_before_delete(monkeypatch, tmp_path):
     """A failed memmap load closes its mapping before deleting backing files."""
     source = tmp_path / "skims.omx"
@@ -741,7 +801,7 @@ def test_reload_from_omx_3d_shared_parallel():
 
 
 def test_from_omx_compressed_blosc():
-    import hdf5plugin
+    hdf5plugin = pytest.importorskip("hdf5plugin")
 
     rng = np.random.default_rng(7)
     arr = rng.random((25, 25))
