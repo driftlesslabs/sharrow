@@ -10,6 +10,7 @@ import xarray as xr
 from pytest import approx
 
 import sharrow as sh
+from sharrow.shared_memory import SharedMemDatasetAccessor
 
 
 def test_dataset_construct_with_zoneids():
@@ -533,6 +534,54 @@ def test_from_omx_3d_memmap_low_memory():
 
         assert not backing.exists()
         assert not Path(f"{backing}.meta.pkl").exists()
+
+
+def test_from_omx_3d_memmap_failure_releases_before_delete(monkeypatch, tmp_path):
+    """A failed memmap load closes its mapping before deleting backing files."""
+    source = tmp_path / "skims.omx"
+    backing = tmp_path / "skims-memory.dat"
+    _write_compressed_omx(source, _random_matrices())
+
+    def fail_load(*args, **kwargs):
+        raise RuntimeError("injected load failure")
+
+    cleanup_steps = []
+    original_release = SharedMemDatasetAccessor.release_shared_memory
+    original_delete = SharedMemDatasetAccessor.delete_shared_memory_files
+
+    def record_release(accessor):
+        cleanup_steps.append("release")
+        original_release(accessor)
+
+    def record_delete(key):
+        # Model Windows' requirement that a file cannot be unlinked while its
+        # memory mapping remains open.
+        assert cleanup_steps == ["release"]
+        cleanup_steps.append("delete")
+        original_delete(key)
+
+    monkeypatch.setattr(sh.dataset, "_load_omx_assignments", fail_load)
+    monkeypatch.setattr(
+        SharedMemDatasetAccessor, "release_shared_memory", record_release
+    )
+    monkeypatch.setattr(
+        SharedMemDatasetAccessor,
+        "delete_shared_memory_files",
+        staticmethod(record_delete),
+    )
+
+    with pytest.raises(RuntimeError, match="injected load failure"):
+        sh.dataset.from_omx_3d(
+            source,
+            time_periods=["EA", "AM", "PM"],
+            load="memmap",
+            memory_path=backing,
+            workers=1,
+        )
+
+    assert cleanup_steps == ["release", "delete"]
+    assert not backing.exists()
+    assert not Path(f"{backing}.meta.pkl").exists()
 
 
 @pytest.mark.parametrize(

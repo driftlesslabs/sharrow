@@ -1088,6 +1088,9 @@ def from_omx_3d(
             if load == "shared":
                 result.shm.release_shared_memory()
             else:
+                # Close the mapping before unlinking its backing files. Windows
+                # does not permit deletion while the memmap is still open.
+                result.shm.release_shared_memory()
                 result.shm.delete_shared_memory_files(key)
             raise
     finally:

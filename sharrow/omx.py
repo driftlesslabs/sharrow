@@ -58,11 +58,17 @@ def split_omx(source_file, dest_directory, global_lookups=False, n_chunks=None):
             chunk_names = [f"{name}.omx" for name in matrix_names]
 
         output_paths = []
+        initialized_outputs = set()
         for number, matrix_name in enumerate(matrix_names):
             output_path = destination / chunk_names[number % len(chunk_names)]
             output_paths.append(output_path)
             logger.info(f"writing {matrix_name} to {output_path}")
-            with h5py.File(output_path, "a") as target:
+            # Truncate each output the first time it is used so rerunning a
+            # split cannot preserve stale matrices or lookups. Later matrices
+            # assigned to the same chunk append to the freshly initialized file.
+            mode = "a" if output_path in initialized_outputs else "w"
+            initialized_outputs.add(output_path)
+            with h5py.File(output_path, mode) as target:
                 _initialize_omx_file(source, target)
                 _copy_dataset(source["data"], target["data"], matrix_name)
 

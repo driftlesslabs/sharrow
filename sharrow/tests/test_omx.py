@@ -68,6 +68,26 @@ def test_split_omx_with_separate_lookups(omx_file, tmp_path):
         np.testing.assert_array_equal(handle["lookup/taz"], [101, 102, 103])
 
 
+def test_split_omx_replaces_existing_matrix_outputs(omx_file, tmp_path):
+    """Rerunning a split removes stale matrices and previously copied lookups."""
+    source_path, matrices = omx_file
+    destination = tmp_path / "rerun"
+
+    split_omx(source_path, destination, global_lookups=True, n_chunks=2)
+    with h5py.File(destination / "skims-chunk0.omx", "a") as handle:
+        handle.create_dataset("data/STALE", data=np.zeros((3, 3)))
+
+    split_omx(source_path, destination, global_lookups=False, n_chunks=2)
+
+    for chunk_number in range(2):
+        expected_names = {
+            name for number, name in enumerate(matrices) if number % 2 == chunk_number
+        }
+        with h5py.File(destination / f"skims-chunk{chunk_number}.omx") as handle:
+            assert set(handle["data"]) == expected_names
+            assert list(handle["lookup"]) == []
+
+
 def test_omx_to_zarr(omx_file, tmp_path):
     """OMX conversion reads HDF5 matrices into the expected Zarr dimensions."""
     source_path, matrices = omx_file
