@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import os
+import threading
 import zlib
 from collections.abc import Sequence
 
@@ -230,6 +231,7 @@ def _write_chunk(
     filter_mask: int,
     pipeline: Sequence,
     chunk_shape: tuple,
+    source_dtype: np.dtype,
 ) -> None:
     """Decode one raw chunk and write it into its place in `out`.
 
@@ -250,8 +252,13 @@ def _write_chunk(
         The dataset filter pipeline, in write order.
     chunk_shape : tuple[int, ...]
         Shape of a full chunk.
+    source_dtype : numpy.dtype
+        Element type encoded in the source chunk. This may differ from the
+        destination dtype; assignment performs a chunk-local conversion.
     """
-    chunk = _decompress_chunk(raw_bytes, filter_mask, pipeline, out.dtype, chunk_shape)
+    chunk = _decompress_chunk(
+        raw_bytes, filter_mask, pipeline, source_dtype, chunk_shape
+    )
 
     # Edge chunks are stored padded out to the full chunk shape, so the part
     # that actually lands in the dataset may be smaller than the chunk itself.
@@ -266,9 +273,21 @@ def _write_chunk(
 def _fallback_read(dset: h5py.Dataset, out: np.ndarray) -> None:
     """Read `dset` into `out` using h5py's ordinary (serial) read path."""
     if out.flags.c_contiguous:
+        # HDF5 converts to the destination dtype during a direct read.
         dset.read_direct(out)
     else:
-        out[...] = dset[()]
+        out[...] = dset.astype(out.dtype)[()]
+
+
+def _write_chunk_and_release(
+    pending_semaphore: threading.Semaphore,
+    *args,
+) -> None:
+    """Write a decoded chunk and return its slot to the global memory budget."""
+    try:
+        _write_chunk(*args)
+    finally:
+        pending_semaphore.release()
 
 
 def _load_dataset_into(
@@ -276,6 +295,7 @@ def _load_dataset_into(
     out: np.ndarray,
     executor: concurrent.futures.ThreadPoolExecutor,
     max_pending: int,
+    pending_semaphore: threading.Semaphore | None = None,
 ) -> None:
     """Fill `out` with the contents of `dset`, decoding chunks in parallel.
 
@@ -287,11 +307,14 @@ def _load_dataset_into(
     dset : h5py.Dataset
         Source dataset.
     out : numpy.ndarray
-        Destination array; must have the same shape and dtype as `dset`.
+        Destination array; must have the same shape as `dset`. Source chunks
+        are converted to the destination dtype as they are written.
     executor : concurrent.futures.ThreadPoolExecutor
         Pool used to decode chunks.
     max_pending : int
         Maximum number of raw chunks held in memory awaiting decoding.
+    pending_semaphore : threading.Semaphore, optional
+        Process-wide limit on chunks queued by concurrent dataset reads.
     """
     chunk_shape = dset.chunks
     if chunk_shape is None or dset.size == 0:
@@ -320,9 +343,6 @@ def _load_dataset_into(
 
     pending = set()
     for i in range(num_chunks):
-        offset = dset_id.get_chunk_info(i).chunk_offset
-        filter_mask, raw_bytes = dset_id.read_direct_chunk(offset)
-
         if len(pending) >= max_pending:
             done, pending = concurrent.futures.wait(
                 pending, return_when=concurrent.futures.FIRST_COMPLETED
@@ -330,17 +350,39 @@ def _load_dataset_into(
             for future in done:
                 future.result()
 
-        pending.add(
-            executor.submit(
-                _write_chunk,
-                out,
-                offset,
-                raw_bytes,
-                filter_mask,
-                pipeline,
-                chunk_shape,
-            )
-        )
+        if pending_semaphore is not None:
+            pending_semaphore.acquire()
+        try:
+            offset = dset_id.get_chunk_info(i).chunk_offset
+            filter_mask, raw_bytes = dset_id.read_direct_chunk(offset)
+            if pending_semaphore is None:
+                future = executor.submit(
+                    _write_chunk,
+                    out,
+                    offset,
+                    raw_bytes,
+                    filter_mask,
+                    pipeline,
+                    chunk_shape,
+                    dset.dtype,
+                )
+            else:
+                future = executor.submit(
+                    _write_chunk_and_release,
+                    pending_semaphore,
+                    out,
+                    offset,
+                    raw_bytes,
+                    filter_mask,
+                    pipeline,
+                    chunk_shape,
+                    dset.dtype,
+                )
+        except BaseException:
+            if pending_semaphore is not None:
+                pending_semaphore.release()
+            raise
+        pending.add(future)
 
     for future in concurrent.futures.as_completed(pending):
         future.result()
@@ -358,6 +400,7 @@ def read_dataset(
     out: np.ndarray | None = None,
     executor: concurrent.futures.ThreadPoolExecutor | None = None,
     max_workers: int | None = None,
+    pending_semaphore: threading.Semaphore | None = None,
 ) -> np.ndarray:
     """Read an already-open HDF5 dataset, decoding its chunks in parallel.
 
@@ -366,14 +409,17 @@ def read_dataset(
     dset : h5py.Dataset
         The dataset to read.
     out : numpy.ndarray, optional
-        Destination array, which must have the same shape and dtype as
-        `dset`.  It may be a non-contiguous view (e.g. a slice of a larger
-        array).  If not given, a new array is allocated.
+        Destination array, which must have the same shape as `dset`. It may
+        use a different dtype and may be a non-contiguous view (e.g. a slice
+        of a larger array). If not given, a source-dtype array is allocated.
     executor : concurrent.futures.ThreadPoolExecutor, optional
         Pool used to decode chunks.  If not given, a temporary pool is created
         and shut down before returning.
     max_workers : int, optional
         Size of the temporary thread pool.  Ignored when `executor` is given.
+    pending_semaphore : threading.Semaphore, optional
+        Shared bound on in-flight chunks when several calls use the same
+        executor concurrently.
 
     Returns
     -------
@@ -385,12 +431,22 @@ def read_dataset(
     else:
         if tuple(out.shape) != tuple(dset.shape):
             raise ValueError(f"out has shape {out.shape}, expected {dset.shape}")
-        if out.dtype != dset.dtype:
-            raise ValueError(f"out has dtype {out.dtype}, expected {dset.dtype}")
     if executor is not None:
         workers = getattr(executor, "_max_workers", None)
-        _load_dataset_into(dset, out, executor, _max_pending(workers))
+        _load_dataset_into(
+            dset,
+            out,
+            executor,
+            _max_pending(workers),
+            pending_semaphore=pending_semaphore,
+        )
     else:
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
-            _load_dataset_into(dset, out, pool, _max_pending(max_workers))
+            _load_dataset_into(
+                dset,
+                out,
+                pool,
+                _max_pending(max_workers),
+                pending_semaphore=pending_semaphore,
+            )
     return out

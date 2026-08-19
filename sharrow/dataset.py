@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import atexit
 import base64
 import concurrent.futures
 import contextlib
@@ -10,6 +11,7 @@ import multiprocessing
 import os
 import re
 import secrets
+import threading
 import time
 from collections.abc import Hashable, Iterable, Mapping, Sequence
 from pathlib import Path
@@ -30,6 +32,64 @@ from .shared_memory import si_units
 from .table import Table
 
 logger = logging.getLogger("sharrow")
+
+
+class _OmxReadCoordinator:
+    """Share a bounded decoder pool across all matrices in one load."""
+
+    def __init__(self, max_workers=None):
+        if max_workers is None:
+            # Match ThreadPoolExecutor's Python 3.9+ default while keeping the
+            # queue budget explicit and stable across concurrent Dask tasks.
+            max_workers = min(32, (os.cpu_count() or 1) + 4)
+        self.executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=max_workers, thread_name_prefix="sharrow-omx"
+        )
+        self.pending_semaphore = threading.BoundedSemaphore(max(2 * max_workers, 4))
+
+    def read(self, dset, out):
+        """Decode one HDF5 dataset into an existing destination array."""
+        return omx_reader.read_dataset(
+            dset,
+            out=out,
+            executor=self.executor,
+            pending_semaphore=self.pending_semaphore,
+        )
+
+    def close(self):
+        """Wait for decoder work and release the pool's threads."""
+        self.executor.shutdown(wait=True)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+
+
+_lazy_omx_reader = None
+_lazy_omx_reader_lock = threading.Lock()
+
+
+def _get_lazy_omx_reader():
+    """Return the process-wide decoder pool shared by concurrent Dask tasks."""
+    global _lazy_omx_reader
+    if _lazy_omx_reader is None:
+        with _lazy_omx_reader_lock:
+            if _lazy_omx_reader is None:
+                _lazy_omx_reader = _OmxReadCoordinator()
+    return _lazy_omx_reader
+
+
+def _shutdown_lazy_omx_reader():
+    """Release the process-wide lazy decoder pool during interpreter shutdown."""
+    global _lazy_omx_reader
+    if _lazy_omx_reader is not None:
+        _lazy_omx_reader.close()
+        _lazy_omx_reader = None
+
+
+atexit.register(_shutdown_lazy_omx_reader)
 
 well_known_names = {
     "nb",
@@ -297,6 +357,29 @@ def _group_names(grp) -> list[str]:
     return list(grp.keys())
 
 
+def _omx_shape(omx: h5py.File) -> tuple[int, int]:
+    """Read OMX shape metadata or infer it from the first matrix.
+
+    Older OpenMatrix writers did not always persist the optional ``SHAPE``
+    attribute. Their readers inferred the dimensions from matrix data, so the
+    h5py implementation retains that compatibility behavior.
+    """
+    shape = omx.attrs.get("SHAPE")
+    if shape is None:
+        data_group = omx["data"]
+        try:
+            first_name = next(iter(data_group))
+        except StopIteration:
+            raise ValueError(
+                "cannot infer OMX shape from an empty data group"
+            ) from None
+        shape = data_group[first_name].shape
+    shape = tuple(int(i) for i in shape)
+    if len(shape) != 2:
+        raise ValueError(f"OMX matrices must be two-dimensional, found shape {shape}")
+    return shape
+
+
 def omx_file_name(omx) -> str | None:
     """Resolve the on-disk filename of an OMX HDF5 file, if possible.
 
@@ -377,7 +460,7 @@ def from_omx(
 
     omx_data = omx["data"]
     omx_lookup = omx["lookup"]
-    omx_shape = tuple(int(i) for i in omx.attrs["SHAPE"])
+    omx_shape = _omx_shape(omx)
 
     if renames is None:
         data_names = _group_names(omx_data)
@@ -483,24 +566,20 @@ def _empty_omx_3d(shape, dtype):
     return np.ndarray(shape, dtype=dtype, buffer=buffer, strides=strides)
 
 
-def _read_omx_dataset(dset, out=None, dtype=None):
-    """Read one HDF5 dataset with native h5py decompression and conversion."""
-    if out is not None:
-        if out.flags.c_contiguous:
-            # HDF5 converts directly to the destination dtype when needed.
-            dset.read_direct(out)
-        else:
-            # h5py requires a C-contiguous destination.  This fallback is used
-            # for ordinary C-order 3-D arrays whose last-axis pages are strided.
-            out[...] = dset.astype(out.dtype)[()]
-        return out
-    if dtype is None or np.dtype(dtype) == dset.dtype:
-        return dset[()]
-    return dset.astype(np.dtype(dtype))[()]
+def _read_omx_dataset(dset, out=None, dtype=None, reader=None):
+    """Read one HDF5 dataset through the bounded parallel chunk decoder."""
+    if out is None:
+        target_dtype = dset.dtype if dtype is None else np.dtype(dtype)
+        out = np.empty(dset.shape, dtype=target_dtype)
+    elif dtype is not None and np.dtype(dtype) != out.dtype:
+        raise ValueError(f"out has dtype {out.dtype}, requested {np.dtype(dtype)}")
+    if reader is None:
+        reader = _get_lazy_omx_reader()
+    return reader.read(dset, out)
 
 
 def _fast_load_omx_array(filename, name, dtype=None):
-    """Load one matrix table through h5py's native HDF5 filter pipeline."""
+    """Load one matrix table through the shared parallel decoder pool."""
     with h5py.File(filename, "r") as f:
         return _read_omx_dataset(f["data"][name], dtype=dtype)
 
@@ -509,6 +588,7 @@ def _load_omx_variable(page_sources, shape, dtype):
     """Load all pages of one logical OMX variable in a single Dask task."""
     result = _empty_omx_3d(shape, dtype)
     open_files = {}
+    reader = _get_lazy_omx_reader()
     try:
         for period, source in enumerate(page_sources):
             if source is None:
@@ -521,7 +601,9 @@ def _load_omx_variable(page_sources, shape, dtype):
             if filename not in open_files:
                 open_files[filename] = h5py.File(filename, "r")
             _read_omx_dataset(
-                open_files[filename]["data"][data_name], result[..., period]
+                open_files[filename]["data"][data_name],
+                result[..., period],
+                reader=reader,
             )
     finally:
         for handle in open_files.values():
@@ -529,8 +611,11 @@ def _load_omx_variable(page_sources, shape, dtype):
     return result
 
 
-def _load_omx_assignments(dataset, source, assignments):
+def _load_omx_assignments(dataset, source, assignments, reader=None):
     """Load all selected matrices from one source into a prepared Dataset."""
+    if reader is None:
+        with _OmxReadCoordinator() as reader:
+            return _load_omx_assignments(dataset, source, assignments, reader=reader)
     if isinstance(source, h5py.File):
         file_context = contextlib.nullcontext(source)
     else:
@@ -547,7 +632,7 @@ def _load_omx_assignments(dataset, source, assignments):
             target = dataset[variable_name].data
             if period is not None:
                 target = target[..., period]
-            _read_omx_dataset(data_group[data_name], target)
+            _read_omx_dataset(data_group[data_name], target, reader=reader)
             bytes_loaded += target.nbytes
     return bytes_loaded
 
@@ -806,7 +891,7 @@ def from_omx_3d(
     omx_handles = use_file_handles
 
     try:
-        omx_shape = tuple(int(i) for i in omx_handles[0].attrs["SHAPE"])
+        omx_shape = _omx_shape(omx_handles[0])
         omx_lookup = omx_handles[0]["lookup"]
         omx_data = [handle["data"] for handle in omx_handles]
         omx_data_map = {}
@@ -995,9 +1080,12 @@ def from_omx_3d(
                 dims = index_names if array.ndim == 3 else index_names[:2]
                 content[variable_name] = (dims, array)
             result = xr.Dataset(content, coords=coords)
-            for source, source_assignments in zip(omx_handles, assignments):
-                if source_assignments:
-                    _load_omx_assignments(result, source, source_assignments)
+            with _OmxReadCoordinator() as reader:
+                for source, source_assignments in zip(omx_handles, assignments):
+                    if source_assignments:
+                        _load_omx_assignments(
+                            result, source, source_assignments, reader=reader
+                        )
             return result
 
         # Shared and memory-mapped modes use a lightweight template to reserve
@@ -1056,10 +1144,11 @@ def from_omx_3d(
         started = time.time()
         try:
             if worker_count == 1:
-                bytes_loaded = sum(
-                    _load_omx_assignments(result, source, batch)
-                    for source, batch in active_batches
-                )
+                with _OmxReadCoordinator() as reader:
+                    bytes_loaded = sum(
+                        _load_omx_assignments(result, source, batch, reader=reader)
+                        for source, batch in active_batches
+                    )
             else:
                 # Spawn avoids inheriting any HDF5 state held by the caller.
                 mp_context = multiprocessing.get_context("spawn")
@@ -1176,10 +1265,16 @@ def reload_from_omx_3d(
 
     started = time.time()
     if worker_count == 1:
-        bytes_loaded = sum(
-            _load_omx_assignments(dataset, sources[source_number], batch)
-            for source_number, batch in active_batches
-        )
+        with _OmxReadCoordinator() as reader:
+            bytes_loaded = sum(
+                _load_omx_assignments(
+                    dataset,
+                    sources[source_number],
+                    batch,
+                    reader=reader,
+                )
+                for source_number, batch in active_batches
+            )
     else:
         shared_memory_key = dataset.shm.shared_memory_key
         mp_context = multiprocessing.get_context("spawn")

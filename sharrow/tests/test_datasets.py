@@ -10,6 +10,7 @@ import xarray as xr
 from pytest import approx
 
 import sharrow as sh
+from sharrow import omx_reader
 from sharrow.shared_memory import SharedMemDatasetAccessor
 
 
@@ -340,6 +341,67 @@ def _random_matrices(n=25, seed=42):
         "TIME__PM": (rng.random((n, n)) * 100).astype(np.float32),
         "COUNTS": rng.integers(0, 9999, (n, n)).astype(np.int32),
     }
+
+
+def test_parallel_omx_reader_converts_into_noncontiguous_output(tmp_path):
+    """Parallel chunk decoding casts directly into a final array view."""
+    source = np.arange(625, dtype=np.float64).reshape(25, 25) / 7
+    path = tmp_path / "direct-conversion.h5"
+    with h5py.File(path, "w") as handle:
+        handle.create_dataset(
+            "data",
+            data=source,
+            compression="gzip",
+            shuffle=True,
+            chunks=(7, 7),
+        )
+
+    backing = np.empty((25, 25, 2), dtype=np.float32)
+    destination = backing[..., 1]
+    assert not destination.flags.c_contiguous
+    with h5py.File(path, "r") as handle:
+        result = omx_reader.read_dataset(handle["data"], out=destination, max_workers=2)
+
+    assert result is destination
+    np.testing.assert_array_equal(destination, source.astype(np.float32))
+
+
+def test_parallel_omx_reader_fallback_converts_dtype(tmp_path):
+    """The native h5py fallback also converts into the requested dtype."""
+    source = np.arange(36, dtype=np.float64).reshape(6, 6) / 7
+    path = tmp_path / "uncompressed.h5"
+    with h5py.File(path, "w") as handle:
+        handle.create_dataset("data", data=source)
+
+    destination = np.empty(source.shape, dtype=np.float32)
+    with h5py.File(path, "r") as handle:
+        omx_reader.read_dataset(handle["data"], out=destination, max_workers=2)
+    np.testing.assert_array_equal(destination, source.astype(np.float32))
+
+
+def test_omx_shape_is_inferred_when_attribute_is_missing(tmp_path):
+    """Files written without SHAPE retain OpenMatrix-compatible behavior."""
+    matrices = _random_matrices()
+    path = tmp_path / "missing-shape.omx"
+    _write_compressed_omx(path, matrices)
+    with h5py.File(path, "r+") as handle:
+        del handle.attrs["SHAPE"]
+
+    two_dimensional = sh.dataset.from_omx(path, indexes="taz")
+    three_dimensional = sh.dataset.from_omx_3d(
+        path,
+        indexes="taz",
+        time_periods=["AM", "PM"],
+        load="eager",
+    )
+
+    np.testing.assert_array_equal(two_dimensional["DIST"], matrices["DIST"])
+    np.testing.assert_array_equal(
+        three_dimensional["DIST"], matrices["DIST"].astype(np.float32)
+    )
+    np.testing.assert_array_equal(
+        three_dimensional["TIME"].sel(time_period="PM"), matrices["TIME__PM"]
+    )
 
 
 def test_from_omx_compressed_zlib():
